@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/mahin273/RateMesh/internal/policy"
 )
@@ -15,11 +16,12 @@ type contextKey string
 
 const PolicyKey contextKey = "policy"
 
-// RateLimiter returns a middleware that resolves route policy and enforces strict rate limits.
+// RateLimiter returns a middleware that resolves route policy and enforces rate limits.
 func RateLimiter(
 	policyService policy.Service,
 	tokenBucket RateLimitStrategy,
 	slidingWindow RateLimitStrategy,
+	localStore *LocalBucketStore,
 ) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,33 +50,54 @@ func RateLimiter(
 			// Determine key and strategy
 			routeHash := hashRoute(p.RoutePattern)
 			var limitKey string
-			var strategy RateLimitStrategy
 
 			switch p.Strategy {
 			case policy.StrategySlidingWindow:
 				limitKey = fmt.Sprintf("ratelimit:sw:%s:%s", tenant.ID, routeHash)
-				strategy = slidingWindow
 			case policy.StrategyTokenBucket:
 				fallthrough
 			default:
 				limitKey = fmt.Sprintf("ratelimit:%s:%s", tenant.ID, routeHash)
-				strategy = tokenBucket
 			}
 
-			// Strict mode synchronous check (reconciler and local counting are wired in Phase 3)
-			res, err := strategy.Check(r.Context(), limitKey, p.LimitPerWindow, p.WindowSeconds, p.BurstAllowance)
-			if err != nil {
-				// Standard rate-limiting error fallback
-				http.Error(w, "rate limit evaluation failed", http.StatusInternalServerError)
-				return
+			var allowed bool
+			var remaining int
+			var resetSecs int
+
+			if p.Mode == policy.ModeEventual {
+				bucket := localStore.GetOrCreate(limitKey, p.LimitPerWindow, p.WindowSeconds, p.BurstAllowance)
+				allowed, remaining = bucket.Allow(time.Now())
+				refillRate := float64(p.LimitPerWindow) / float64(p.WindowSeconds)
+				maxTokens := p.LimitPerWindow + p.BurstAllowance
+				if remaining < maxTokens && refillRate > 0 {
+					missing := float64(maxTokens - remaining)
+					resetSecs = int(missing / refillRate)
+				}
+			} else {
+				// Strict mode synchronous check
+				var strategy RateLimitStrategy
+				if p.Strategy == policy.StrategySlidingWindow {
+					strategy = slidingWindow
+				} else {
+					strategy = tokenBucket
+				}
+
+				res, err := strategy.Check(r.Context(), limitKey, p.LimitPerWindow, p.WindowSeconds, p.BurstAllowance)
+				if err != nil {
+					http.Error(w, "rate limit evaluation failed", http.StatusInternalServerError)
+					return
+				}
+				allowed = res.Allowed
+				remaining = res.Remaining
+				resetSecs = int(res.Reset.Seconds())
 			}
 
 			// Inject Rate-Limiting Headers
 			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(p.LimitPerWindow))
-			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
-			w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(res.Reset.Seconds())))
+			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+			w.Header().Set("X-RateLimit-Reset", strconv.Itoa(resetSecs))
 
-			if !res.Allowed {
+			if !allowed {
 				http.Error(w, "too many requests", http.StatusTooManyRequests)
 				return
 			}

@@ -63,8 +63,13 @@ func main() {
 		log.Fatalf("Failed to initialize sliding window strategy: %v", err)
 	}
 
+	// Initialize local bucket store and reconciler for eventual consistency mode
+	localStore := ratelimit.NewLocalBucketStore()
+	reconciler := ratelimit.NewReconciler(redisClient, localStore, cfg.SyncInterval)
+	reconciler.Start()
+
 	// Create Rate Limiter Middleware
-	rateLimiterMiddleware := ratelimit.RateLimiter(policyService, tokenBucket, slidingWindow)
+	rateLimiterMiddleware := ratelimit.RateLimiter(policyService, tokenBucket, slidingWindow, localStore)
 
 	// Setup Reverse Proxy
 	proxy, err := gateway.NewProxy(cfg.UpstreamURL)
@@ -98,6 +103,10 @@ func main() {
 	<-quit
 
 	log.Println("Initiating graceful shutdown...")
+
+	// Stop reconciler background task and flush remaining deltas
+	reconciler.Stop()
+	log.Println("Rate limiting reconciler stopped.")
 
 	// Allow 10 seconds for existing requests to finish processing
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

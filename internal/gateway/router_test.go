@@ -134,7 +134,8 @@ func TestRouterWorkflow(t *testing.T) {
 			}
 
 			mockStrat := &mockRateLimitStrategy{result: rlResult}
-			rateLimiter := ratelimit.RateLimiter(svc, mockStrat, mockStrat)
+			localStore := ratelimit.NewLocalBucketStore()
+			rateLimiter := ratelimit.RateLimiter(svc, mockStrat, mockStrat, localStore)
 
 			router := NewRouter(svc, rateLimiter, proxy)
 
