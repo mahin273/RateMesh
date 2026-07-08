@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mahin273/RateMesh/internal/observability"
 	"github.com/mahin273/RateMesh/internal/redisclient"
 	"github.com/redis/go-redis/v9"
 )
@@ -68,6 +69,8 @@ type pendingUpdate struct {
 }
 
 func (r *Reconciler) reconcile(ctx context.Context) {
+	startTime := time.Now()
+
 	pipe := r.client.Pipeline()
 	var updates []pendingUpdate
 
@@ -91,9 +94,17 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	}
 
 	_, err := pipe.Exec(ctx)
+
+	// Record execution metrics
+	duration := time.Since(startTime).Seconds()
+	observability.ReconcilerSyncDuration.Observe(duration)
+
+	status := "success"
 	if err != nil && err != redis.Nil {
+		status = "error"
 		log.Printf("reconciler pipeline execution error: %v", err)
 	}
+	observability.ReconcilerSyncsTotal.WithLabelValues(status).Inc()
 
 	for _, u := range updates {
 		var globalCount int64

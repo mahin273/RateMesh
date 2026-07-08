@@ -3,7 +3,10 @@ package plugin
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"time"
 
+	"github.com/mahin273/RateMesh/internal/observability"
 	"github.com/mahin273/RateMesh/internal/policy"
 )
 
@@ -11,10 +14,31 @@ type pluginCtxKey string
 
 const EnabledPluginsKey pluginCtxKey = "enabled_plugins"
 
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func newResponseWriterWrapper(w http.ResponseWriter) *responseWriterWrapper {
+	return &responseWriterWrapper{ResponseWriter: w, statusCode: http.StatusOK}
+}
+
+func (w *responseWriterWrapper) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 // PluginExecutor returns a middleware that resolves tenant plugins and runs OnRequest hooks.
 func PluginExecutor(policyService policy.Service, registry *Registry) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			startTime := time.Now()
+
+			if r.URL.Path == "/metrics" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			tenant := policy.GetTenantFromContext(r.Context())
 			if tenant == nil {
 				http.Error(w, "unauthorized tenant context", http.StatusUnauthorized)
@@ -22,8 +46,6 @@ func PluginExecutor(policyService policy.Service, registry *Registry) func(http.
 			}
 
 			// Retrieve resolved route policy from context (assumes PolicyResolver middleware ran first)
-			// Wait, we can resolve policy here directly, or define a small middleware in policy package.
-			// Let's resolve it here directly or in policy package. Resolving here directly is simple:
 			p, err := policyService.ResolveRoutePolicy(r.Context(), tenant.ID, r.Method, r.URL.Path)
 			if err != nil {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
@@ -71,19 +93,34 @@ func PluginExecutor(policyService policy.Service, registry *Registry) func(http.
 				return
 			}
 
+			// Wrap ResponseWriter to capture the status code for metrics
+			wrapped := newResponseWriterWrapper(w)
+
 			if sc != nil {
 				// Copy short-circuit headers
 				for k, values := range sc.Headers {
 					for _, v := range values {
-						w.Header().Add(k, v)
+						wrapped.Header().Add(k, v)
 					}
 				}
-				w.WriteHeader(sc.StatusCode)
-				w.Write(sc.Body)
+				wrapped.WriteHeader(sc.StatusCode)
+				wrapped.Write(sc.Body)
+
+				// Track metrics for short-circuited request
+				duration := time.Since(startTime).Seconds()
+				statusStr := strconv.Itoa(sc.StatusCode)
+				observability.HttpRequestsTotal.WithLabelValues(tenant.ID, r.URL.Path, r.Method, statusStr).Inc()
+				observability.HttpRequestDuration.WithLabelValues(tenant.ID, r.URL.Path, r.Method).Observe(duration)
 				return
 			}
 
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(wrapped, r)
+
+			// Track metrics for proxied request
+			duration := time.Since(startTime).Seconds()
+			statusStr := strconv.Itoa(wrapped.statusCode)
+			observability.HttpRequestsTotal.WithLabelValues(tenant.ID, r.URL.Path, r.Method, statusStr).Inc()
+			observability.HttpRequestDuration.WithLabelValues(tenant.ID, r.URL.Path, r.Method).Observe(duration)
 		})
 	}
 }

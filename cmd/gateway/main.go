@@ -17,6 +17,7 @@ import (
 	"github.com/mahin273/RateMesh/internal/plugin/builtin/auth"
 	"github.com/mahin273/RateMesh/internal/plugin/builtin/logging"
 	"github.com/mahin273/RateMesh/internal/plugin/builtin/transform"
+	"github.com/mahin273/RateMesh/internal/observability"
 	"github.com/mahin273/RateMesh/internal/ratelimit"
 	"github.com/mahin273/RateMesh/internal/redisclient"
 	"github.com/mahin273/RateMesh/pkg/config"
@@ -27,6 +28,17 @@ func main() {
 
 	// Load configuration
 	cfg := config.Load()
+
+	// Initialize OpenTelemetry Tracing
+	tp, err := observability.InitTracer(context.Background(), "RateMesh-Gateway", cfg.OtelExporterEndpoint)
+	if err != nil {
+		log.Printf("Warning: failed to initialize tracer: %v", err)
+	}
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
 
 	// Initialize Database connection
 	database, err := db.Connect(cfg.DatabaseURL)

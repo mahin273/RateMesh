@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/mahin273/RateMesh/internal/observability"
 	"github.com/mahin273/RateMesh/internal/plugin"
 	"github.com/mahin273/RateMesh/internal/policy"
 )
@@ -51,6 +52,9 @@ type rateLimitState struct {
 }
 
 func (p *RateLimitPlugin) OnRequest(ctx context.Context, rc *plugin.RequestContext) (*plugin.ShortCircuit, error) {
+	ctx, span := observability.Tracer.Start(ctx, "RateLimitPlugin.OnRequest")
+	defer span.End()
+
 	tenant := policy.GetTenantFromContext(ctx)
 	if tenant == nil {
 		return &plugin.ShortCircuit{
@@ -132,6 +136,18 @@ func (p *RateLimitPlugin) OnRequest(ctx context.Context, rc *plugin.RequestConte
 	}
 	reqCtx = context.WithValue(rc.Request.Context(), "rate_limit_state", state)
 	rc.Request = rc.Request.WithContext(reqCtx)
+
+	action := "allowed"
+	if !allowed {
+		action = "blocked"
+	}
+	observability.RateLimitHitsTotal.WithLabelValues(
+		tenant.ID,
+		routePolicy.RoutePattern,
+		string(routePolicy.Strategy),
+		string(routePolicy.Mode),
+		action,
+	).Inc()
 
 	if !allowed {
 		headers := make(http.Header)
