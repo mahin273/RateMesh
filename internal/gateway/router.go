@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"log"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -10,7 +9,7 @@ import (
 )
 
 // NewRouter constructs and configures the Chi router middleware chain and handlers.
-func NewRouter(policyService policy.Service, proxy *Proxy) *chi.Mux {
+func NewRouter(policyService policy.Service, rateLimiter func(http.Handler) http.Handler, proxy *Proxy) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Standard middleware
@@ -22,28 +21,11 @@ func NewRouter(policyService policy.Service, proxy *Proxy) *chi.Mux {
 	// Tenant Resolution Middleware
 	r.Use(TenantResolver(policyService))
 
-	// Main API gateway routing logic
+	// Rate Limiting Middleware (resolves policy and enforces limits)
+	r.Use(rateLimiter)
+
+	// Main API gateway routing logic (proxies allowed requests)
 	r.HandleFunc("/*", func(w http.ResponseWriter, req *http.Request) {
-		tenant := GetTenantFromContext(req.Context())
-		if tenant == nil {
-			http.Error(w, "unauthorized tenant context", http.StatusUnauthorized)
-			return
-		}
-
-		// Resolve policy for the requested route and HTTP method
-		p, err := policyService.ResolveRoutePolicy(req.Context(), tenant.ID, req.Method, req.URL.Path)
-		if err != nil {
-			log.Printf("error resolving policy: %v", err)
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		if p == nil {
-			http.Error(w, "no route policy matches requested pattern", http.StatusNotFound)
-			return
-		}
-
-		// Forward to upstream target service
 		proxy.ServeHTTP(w, req)
 	})
 

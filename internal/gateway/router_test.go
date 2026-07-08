@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mahin273/RateMesh/internal/policy"
+	"github.com/mahin273/RateMesh/internal/ratelimit"
 )
 
 type mockPolicyService struct {
@@ -27,6 +29,18 @@ func (m *mockPolicyService) ResolveRoutePolicy(ctx context.Context, tenantID, me
 	return m.policy, m.err
 }
 
+type mockRateLimitStrategy struct {
+	result *ratelimit.Result
+	err    error
+}
+
+func (m *mockRateLimitStrategy) Check(ctx context.Context, key string, limit int, window int, burst int) (*ratelimit.Result, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.result, nil
+}
+
 func TestRouterWorkflow(t *testing.T) {
 	// Set up a mock upstream server
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,13 +55,14 @@ func TestRouterWorkflow(t *testing.T) {
 	}
 
 	tests := []struct {
-		name           string
-		headerTenantID string
-		host           string
-		tenant         *policy.Tenant
-		policy         *policy.RoutePolicy
-		expectedStatus int
-		expectedBody   string
+		name            string
+		headerTenantID  string
+		host            string
+		tenant          *policy.Tenant
+		policy          *policy.RoutePolicy
+		rateLimitResult *ratelimit.Result
+		expectedStatus  int
+		expectedBody    string
 	}{
 		{
 			name:           "missing tenant identifier",
@@ -91,6 +106,16 @@ func TestRouterWorkflow(t *testing.T) {
 			expectedStatus: http.StatusOK,
 			expectedBody:   "upstream-response",
 		},
+		{
+			name:            "rate limit exceeded (429)",
+			headerTenantID:  "tenant-1",
+			host:            "localhost",
+			tenant:          &policy.Tenant{ID: "tenant-1"},
+			policy:          &policy.RoutePolicy{ID: "policy-1", LimitPerWindow: 100},
+			rateLimitResult: &ratelimit.Result{Allowed: false, Remaining: 0, Reset: 10 * time.Second},
+			expectedStatus:  http.StatusTooManyRequests,
+			expectedBody:    "too many requests",
+		},
 	}
 
 	for _, tt := range tests {
@@ -99,7 +124,19 @@ func TestRouterWorkflow(t *testing.T) {
 				tenant: tt.tenant,
 				policy: tt.policy,
 			}
-			router := NewRouter(svc, proxy)
+
+			// Configure mock rate limiter strategy
+			var rlResult *ratelimit.Result
+			if tt.rateLimitResult != nil {
+				rlResult = tt.rateLimitResult
+			} else {
+				rlResult = &ratelimit.Result{Allowed: true, Remaining: 99, Reset: 5 * time.Second}
+			}
+
+			mockStrat := &mockRateLimitStrategy{result: rlResult}
+			rateLimiter := ratelimit.RateLimiter(svc, mockStrat, mockStrat)
+
+			router := NewRouter(svc, rateLimiter, proxy)
 
 			req := httptest.NewRequest("GET", "/test-path", nil)
 			if tt.host != "" {

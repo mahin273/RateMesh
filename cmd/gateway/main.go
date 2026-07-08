@@ -13,6 +13,8 @@ import (
 	"github.com/mahin273/RateMesh/internal/db"
 	"github.com/mahin273/RateMesh/internal/gateway"
 	"github.com/mahin273/RateMesh/internal/policy"
+	"github.com/mahin273/RateMesh/internal/ratelimit"
+	"github.com/mahin273/RateMesh/internal/redisclient"
 	"github.com/mahin273/RateMesh/pkg/config"
 )
 
@@ -33,9 +35,36 @@ func main() {
 		}
 	}()
 
-	// Initialize Policy Repository and Service (cache is nil in Phase 1)
+	// Initialize Redis connection
+	redisClient, err := redisclient.NewClient(cfg.RedisAddress)
+	if err != nil {
+		log.Fatalf("Redis connection error: %v", err)
+	}
+	defer func() {
+		if err := redisClient.Close(); err != nil {
+			log.Printf("Error closing Redis: %v", err)
+		}
+	}()
+
+	// Initialize Policy Cache (Redis backed)
+	policyCache := policy.NewRedisCache(redisClient)
+
+	// Initialize Policy Repository and Service
 	policyRepo := policy.NewSQLRepository(database.DB)
-	policyService := policy.NewService(policyRepo, nil)
+	policyService := policy.NewService(policyRepo, policyCache)
+
+	// Initialize Rate Limiting Strategies
+	tokenBucket, err := ratelimit.NewTokenBucketStrategy(redisClient)
+	if err != nil {
+		log.Fatalf("Failed to initialize token bucket strategy: %v", err)
+	}
+	slidingWindow, err := ratelimit.NewSlidingWindowStrategy(redisClient)
+	if err != nil {
+		log.Fatalf("Failed to initialize sliding window strategy: %v", err)
+	}
+
+	// Create Rate Limiter Middleware
+	rateLimiterMiddleware := ratelimit.RateLimiter(policyService, tokenBucket, slidingWindow)
 
 	// Setup Reverse Proxy
 	proxy, err := gateway.NewProxy(cfg.UpstreamURL)
@@ -44,7 +73,7 @@ func main() {
 	}
 
 	// Setup Router
-	router := gateway.NewRouter(policyService, proxy)
+	router := gateway.NewRouter(policyService, rateLimiterMiddleware, proxy)
 
 	// Configure HTTP Server
 	server := &http.Server{

@@ -8,9 +8,7 @@ import (
 	"github.com/mahin273/RateMesh/internal/policy"
 )
 
-type contextKey string
 
-const TenantKey contextKey = "tenant"
 
 // TenantResolver middleware extracts and validates tenant from header, query, or subdomain.
 func TenantResolver(policyService policy.Service) func(http.Handler) http.Handler {
@@ -58,7 +56,7 @@ func TenantResolver(policyService policy.Service) func(http.Handler) http.Handle
 			}
 
 			// Attach tenant to context
-			ctx := context.WithValue(r.Context(), TenantKey, tenant)
+			ctx := policy.AttachTenantToContext(r.Context(), tenant)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -66,10 +64,5 @@ func TenantResolver(policyService policy.Service) func(http.Handler) http.Handle
 
 // GetTenantFromContext helper to retrieve Tenant from request context
 func GetTenantFromContext(ctx context.Context) *policy.Tenant {
-	if val := ctx.Value(TenantKey); val != nil {
-		if t, ok := val.(*policy.Tenant); ok {
-			return t
-		}
-	}
-	return nil
+	return policy.GetTenantFromContext(ctx)
 }
