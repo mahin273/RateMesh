@@ -13,6 +13,10 @@ import (
 	"github.com/mahin273/RateMesh/internal/db"
 	"github.com/mahin273/RateMesh/internal/gateway"
 	"github.com/mahin273/RateMesh/internal/policy"
+	"github.com/mahin273/RateMesh/internal/plugin"
+	"github.com/mahin273/RateMesh/internal/plugin/builtin/auth"
+	"github.com/mahin273/RateMesh/internal/plugin/builtin/logging"
+	"github.com/mahin273/RateMesh/internal/plugin/builtin/transform"
 	"github.com/mahin273/RateMesh/internal/ratelimit"
 	"github.com/mahin273/RateMesh/internal/redisclient"
 	"github.com/mahin273/RateMesh/pkg/config"
@@ -68,17 +72,27 @@ func main() {
 	reconciler := ratelimit.NewReconciler(redisClient, localStore, cfg.SyncInterval)
 	reconciler.Start()
 
-	// Create Rate Limiter Middleware
-	rateLimiterMiddleware := ratelimit.RateLimiter(policyService, tokenBucket, slidingWindow, localStore)
+	// Initialize Plugin Registry
+	registry := plugin.NewRegistry()
+
+	// Initialize and register built-in plugins
+	rateLimitPlugin := ratelimit.NewRateLimitPlugin(policyService, tokenBucket, slidingWindow, localStore)
+	registry.Register(rateLimitPlugin)
+	registry.Register(auth.NewJWTAuthPlugin())
+	registry.Register(transform.NewTransformPlugin())
+	registry.Register(logging.NewLoggingPlugin())
+
+	// Create Plugin Executor Middleware
+	pluginExecutor := plugin.PluginExecutor(policyService, registry)
 
 	// Setup Reverse Proxy
-	proxy, err := gateway.NewProxy(cfg.UpstreamURL)
+	proxy, err := gateway.NewProxy(cfg.UpstreamURL, registry)
 	if err != nil {
 		log.Fatalf("Reverse proxy setup error: %v", err)
 	}
 
 	// Setup Router
-	router := gateway.NewRouter(policyService, rateLimiterMiddleware, proxy)
+	router := gateway.NewRouter(policyService, pluginExecutor, proxy)
 
 	// Configure HTTP Server
 	server := &http.Server{

@@ -8,14 +8,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mahin273/RateMesh/internal/plugin"
 	"github.com/mahin273/RateMesh/internal/policy"
 	"github.com/mahin273/RateMesh/internal/ratelimit"
 )
 
 type mockPolicyService struct {
-	tenant *policy.Tenant
-	policy *policy.RoutePolicy
-	err    error
+	tenant  *policy.Tenant
+	policy  *policy.RoutePolicy
+	plugins []*policy.Plugin
+	err     error
 }
 
 func (m *mockPolicyService) GetTenant(ctx context.Context, id string) (*policy.Tenant, error) {
@@ -27,6 +29,20 @@ func (m *mockPolicyService) GetTenant(ctx context.Context, id string) (*policy.T
 
 func (m *mockPolicyService) ResolveRoutePolicy(ctx context.Context, tenantID, method, path string) (*policy.RoutePolicy, error) {
 	return m.policy, m.err
+}
+
+func (m *mockPolicyService) GetPluginsByTenant(ctx context.Context, tenantID string) ([]*policy.Plugin, error) {
+	if m.plugins != nil {
+		return m.plugins, nil
+	}
+	// Default to just the rate-limit plugin enabled
+	return []*policy.Plugin{
+		{
+			PluginName: "rate-limit",
+			Enabled:    true,
+			ConfigJSON: "{}",
+		},
+	}, nil
 }
 
 type mockRateLimitStrategy struct {
@@ -49,17 +65,13 @@ func TestRouterWorkflow(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	proxy, err := NewProxy(upstream.URL)
-	if err != nil {
-		t.Fatalf("failed to create proxy: %v", err)
-	}
-
 	tests := []struct {
 		name            string
 		headerTenantID  string
 		host            string
 		tenant          *policy.Tenant
 		policy          *policy.RoutePolicy
+		plugins         []*policy.Plugin
 		rateLimitResult *ratelimit.Result
 		expectedStatus  int
 		expectedBody    string
@@ -89,7 +101,7 @@ func TestRouterWorkflow(t *testing.T) {
 			expectedBody:   "no route policy matches requested pattern",
 		},
 		{
-			name:           "successful proxy forwarding",
+			name:           "successful proxy forwarding with rate-limiting allowed",
 			headerTenantID: "tenant-1",
 			host:           "localhost",
 			tenant:         &policy.Tenant{ID: "tenant-1"},
@@ -121,8 +133,9 @@ func TestRouterWorkflow(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			svc := &mockPolicyService{
-				tenant: tt.tenant,
-				policy: tt.policy,
+				tenant:  tt.tenant,
+				policy:  tt.policy,
+				plugins: tt.plugins,
 			}
 
 			// Configure mock rate limiter strategy
@@ -135,9 +148,16 @@ func TestRouterWorkflow(t *testing.T) {
 
 			mockStrat := &mockRateLimitStrategy{result: rlResult}
 			localStore := ratelimit.NewLocalBucketStore()
-			rateLimiter := ratelimit.RateLimiter(svc, mockStrat, mockStrat, localStore)
 
-			router := NewRouter(svc, rateLimiter, proxy)
+			// Re-register plugins in a fresh registry per test case to avoid pollution
+			testRegistry := plugin.NewRegistry()
+			rateLimitPlugin := ratelimit.NewRateLimitPlugin(svc, mockStrat, mockStrat, localStore)
+			testRegistry.Register(rateLimitPlugin)
+
+			pluginExecutor := plugin.PluginExecutor(svc, testRegistry)
+			testProxy, _ := NewProxy(upstream.URL, testRegistry)
+
+			router := NewRouter(svc, pluginExecutor, testProxy)
 
 			req := httptest.NewRequest("GET", "/test-path", nil)
 			if tt.host != "" {

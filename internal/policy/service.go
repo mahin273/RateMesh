@@ -18,6 +18,7 @@ type Cache interface {
 type Service interface {
 	GetTenant(ctx context.Context, id string) (*Tenant, error)
 	ResolveRoutePolicy(ctx context.Context, tenantID, method, path string) (*RoutePolicy, error)
+	GetPluginsByTenant(ctx context.Context, tenantID string) ([]*Plugin, error)
 }
 
 type service struct {
@@ -88,4 +89,8 @@ func matchRoute(pattern, path string) bool {
 		return strings.HasPrefix(path, prefix)
 	}
 	return false
+}
+
+func (s *service) GetPluginsByTenant(ctx context.Context, tenantID string) ([]*Plugin, error) {
+	return s.repo.GetPluginsByTenant(ctx, tenantID)
 }

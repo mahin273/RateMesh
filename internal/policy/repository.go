@@ -11,6 +11,8 @@ type Repository interface {
 	GetRoutePoliciesByTenant(ctx context.Context, tenantID string) ([]*RoutePolicy, error)
 	CreateTenant(ctx context.Context, tenant *Tenant) error
 	CreateRoutePolicy(ctx context.Context, policy *RoutePolicy) error
+	GetPluginsByTenant(ctx context.Context, tenantID string) ([]*Plugin, error)
+	CreatePlugin(ctx context.Context, plugin *Plugin) error
 }
 
 type sqlRepository struct {
@@ -87,6 +89,47 @@ func (r *sqlRepository) CreateRoutePolicy(ctx context.Context, policy *RoutePoli
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create route policy: %w", err)
+	}
+	return nil
+}
+
+func (r *sqlRepository) GetPluginsByTenant(ctx context.Context, tenantID string) ([]*Plugin, error) {
+	query := `
+		SELECT id, tenant_id, plugin_name, config_json, enabled, priority
+		FROM plugins
+		WHERE tenant_id = $1 AND enabled = true
+		ORDER BY priority ASC`
+
+	rows, err := r.db.QueryContext(ctx, query, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query plugins: %w", err)
+	}
+	defer rows.Close()
+
+	var plugins []*Plugin
+	for rows.Next() {
+		var p Plugin
+		err := rows.Scan(&p.ID, &p.TenantID, &p.PluginName, &p.ConfigJSON, &p.Enabled, &p.Priority)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan plugin: %w", err)
+		}
+		plugins = append(plugins, &p)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows error: %w", err)
+	}
+
+	return plugins, nil
+}
+
+func (r *sqlRepository) CreatePlugin(ctx context.Context, p *Plugin) error {
+	query := `
+		INSERT INTO plugins (id, tenant_id, plugin_name, config_json, enabled, priority)
+		VALUES ($1, $2, $3, $4, $5, $6)`
+	_, err := r.db.ExecContext(ctx, query, p.ID, p.TenantID, p.PluginName, p.ConfigJSON, p.Enabled, p.Priority)
+	if err != nil {
+		return fmt.Errorf("failed to create plugin: %w", err)
 	}
 	return nil
 }

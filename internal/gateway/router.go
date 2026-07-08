@@ -9,7 +9,7 @@ import (
 )
 
 // NewRouter constructs and configures the Chi router middleware chain and handlers.
-func NewRouter(policyService policy.Service, rateLimiter func(http.Handler) http.Handler, proxy *Proxy) *chi.Mux {
+func NewRouter(policyService policy.Service, pluginExecutor func(http.Handler) http.Handler, proxy *Proxy) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Standard middleware
@@ -21,8 +21,8 @@ func NewRouter(policyService policy.Service, rateLimiter func(http.Handler) http
 	// Tenant Resolution Middleware
 	r.Use(TenantResolver(policyService))
 
-	// Rate Limiting Middleware (resolves policy and enforces limits)
-	r.Use(rateLimiter)
+	// Plugin Execution Middleware (runs auth, rate-limit, transform, logging)
+	r.Use(pluginExecutor)
 
 	// Main API gateway routing logic (proxies allowed requests)
 	r.HandleFunc("/*", func(w http.ResponseWriter, req *http.Request) {

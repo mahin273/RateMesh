@@ -9,116 +9,160 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/mahin273/RateMesh/internal/plugin"
 	"github.com/mahin273/RateMesh/internal/policy"
 )
 
-type contextKey string
+// RateLimitPlugin implements GatewayPlugin to handle distributed rate limiting in the plugin execution pipeline.
+type RateLimitPlugin struct {
+	policyService policy.Service
+	tokenBucket   RateLimitStrategy
+	slidingWindow RateLimitStrategy
+	localStore    *LocalBucketStore
+}
 
-const PolicyKey contextKey = "policy"
-
-// RateLimiter returns a middleware that resolves route policy and enforces rate limits.
-func RateLimiter(
+// NewRateLimitPlugin constructs a new RateLimitPlugin instance.
+func NewRateLimitPlugin(
 	policyService policy.Service,
 	tokenBucket RateLimitStrategy,
 	slidingWindow RateLimitStrategy,
 	localStore *LocalBucketStore,
-) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tenant := policy.GetTenantFromContext(r.Context())
-			if tenant == nil {
-				http.Error(w, "unauthorized tenant context", http.StatusUnauthorized)
-				return
-			}
-
-			// Resolve route policy
-			p, err := policyService.ResolveRoutePolicy(r.Context(), tenant.ID, r.Method, r.URL.Path)
-			if err != nil {
-				http.Error(w, "internal server error", http.StatusInternalServerError)
-				return
-			}
-
-			if p == nil {
-				http.Error(w, "no route policy matches requested pattern", http.StatusNotFound)
-				return
-			}
-
-			// Attach policy to context
-			ctx := context.WithValue(r.Context(), PolicyKey, p)
-			r = r.WithContext(ctx)
-
-			// Determine key and strategy
-			routeHash := hashRoute(p.RoutePattern)
-			var limitKey string
-
-			switch p.Strategy {
-			case policy.StrategySlidingWindow:
-				limitKey = fmt.Sprintf("ratelimit:sw:%s:%s", tenant.ID, routeHash)
-			case policy.StrategyTokenBucket:
-				fallthrough
-			default:
-				limitKey = fmt.Sprintf("ratelimit:%s:%s", tenant.ID, routeHash)
-			}
-
-			var allowed bool
-			var remaining int
-			var resetSecs int
-
-			if p.Mode == policy.ModeEventual {
-				bucket := localStore.GetOrCreate(limitKey, p.LimitPerWindow, p.WindowSeconds, p.BurstAllowance)
-				allowed, remaining = bucket.Allow(time.Now())
-				refillRate := float64(p.LimitPerWindow) / float64(p.WindowSeconds)
-				maxTokens := p.LimitPerWindow + p.BurstAllowance
-				if remaining < maxTokens && refillRate > 0 {
-					missing := float64(maxTokens - remaining)
-					resetSecs = int(missing / refillRate)
-				}
-			} else {
-				// Strict mode synchronous check
-				var strategy RateLimitStrategy
-				if p.Strategy == policy.StrategySlidingWindow {
-					strategy = slidingWindow
-				} else {
-					strategy = tokenBucket
-				}
-
-				res, err := strategy.Check(r.Context(), limitKey, p.LimitPerWindow, p.WindowSeconds, p.BurstAllowance)
-				if err != nil {
-					http.Error(w, "rate limit evaluation failed", http.StatusInternalServerError)
-					return
-				}
-				allowed = res.Allowed
-				remaining = res.Remaining
-				resetSecs = int(res.Reset.Seconds())
-			}
-
-			// Inject Rate-Limiting Headers
-			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(p.LimitPerWindow))
-			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
-			w.Header().Set("X-RateLimit-Reset", strconv.Itoa(resetSecs))
-
-			if !allowed {
-				http.Error(w, "too many requests", http.StatusTooManyRequests)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
+) plugin.GatewayPlugin {
+	return &RateLimitPlugin{
+		policyService: policyService,
+		tokenBucket:   tokenBucket,
+		slidingWindow: slidingWindow,
+		localStore:    localStore,
 	}
 }
 
-// hashRoute generates a short 8-character hex hash from the route pattern.
-func hashRoute(routePattern string) string {
-	hash := sha256.Sum256([]byte(routePattern))
-	return hex.EncodeToString(hash[:4])
+func (p *RateLimitPlugin) Name() string {
+	return "rate-limit"
 }
 
-// GetPolicyFromContext retrieves the matching route policy from the request context.
-func GetPolicyFromContext(ctx context.Context) *policy.RoutePolicy {
-	if val := ctx.Value(PolicyKey); val != nil {
-		if p, ok := val.(*policy.RoutePolicy); ok {
-			return p
+func (p *RateLimitPlugin) Priority() int {
+	return 20 // Runs after auth (10) but before transform (50) and logging (100)
+}
+
+type rateLimitState struct {
+	limit     int
+	remaining int
+	resetSecs int
+}
+
+func (p *RateLimitPlugin) OnRequest(ctx context.Context, rc *plugin.RequestContext) (*plugin.ShortCircuit, error) {
+	tenant := policy.GetTenantFromContext(ctx)
+	if tenant == nil {
+		return &plugin.ShortCircuit{
+			StatusCode: http.StatusUnauthorized,
+			Body:       []byte("unauthorized tenant context"),
+		}, nil
+	}
+
+	// Resolve route policy
+	routePolicy, err := p.policyService.ResolveRoutePolicy(ctx, tenant.ID, rc.Request.Method, rc.Request.URL.Path)
+	if err != nil {
+		return &plugin.ShortCircuit{
+			StatusCode: http.StatusInternalServerError,
+			Body:       []byte("internal server error"),
+		}, nil
+	}
+
+	if routePolicy == nil {
+		return &plugin.ShortCircuit{
+			StatusCode: http.StatusNotFound,
+			Body:       []byte("no route policy matches requested pattern"),
+		}, nil
+	}
+
+	// Attach policy to request context so downstream plugins can access it
+	reqCtx := context.WithValue(rc.Request.Context(), "policy", routePolicy)
+	rc.Request = rc.Request.WithContext(reqCtx)
+
+	routeHash := hashRoute(routePolicy.RoutePattern)
+	var limitKey string
+
+	switch routePolicy.Strategy {
+	case policy.StrategySlidingWindow:
+		limitKey = fmt.Sprintf("ratelimit:sw:%s:%s", tenant.ID, routeHash)
+	case policy.StrategyTokenBucket:
+		fallthrough
+	default:
+		limitKey = fmt.Sprintf("ratelimit:%s:%s", tenant.ID, routeHash)
+	}
+
+	var allowed bool
+	var remaining int
+	var resetSecs int
+
+	if routePolicy.Mode == policy.ModeEventual {
+		bucket := p.localStore.GetOrCreate(limitKey, routePolicy.LimitPerWindow, routePolicy.WindowSeconds, routePolicy.BurstAllowance)
+		allowed, remaining = bucket.Allow(time.Now())
+		refillRate := float64(routePolicy.LimitPerWindow) / float64(routePolicy.WindowSeconds)
+		maxTokens := routePolicy.LimitPerWindow + routePolicy.BurstAllowance
+		if remaining < maxTokens && refillRate > 0 {
+			missing := float64(maxTokens - remaining)
+			resetSecs = int(missing / refillRate)
+		}
+	} else {
+		var strategy RateLimitStrategy
+		if routePolicy.Strategy == policy.StrategySlidingWindow {
+			strategy = p.slidingWindow
+		} else {
+			strategy = p.tokenBucket
+		}
+
+		res, err := strategy.Check(ctx, limitKey, routePolicy.LimitPerWindow, routePolicy.WindowSeconds, routePolicy.BurstAllowance)
+		if err != nil {
+			return &plugin.ShortCircuit{
+				StatusCode: http.StatusInternalServerError,
+				Body:       []byte("rate limit evaluation failed"),
+			}, nil
+		}
+		allowed = res.Allowed
+		remaining = res.Remaining
+		resetSecs = int(res.Reset.Seconds())
+	}
+
+	// Store rate limit parameters in context to allow headers injection in OnResponse
+	state := &rateLimitState{
+		limit:     routePolicy.LimitPerWindow,
+		remaining: remaining,
+		resetSecs: resetSecs,
+	}
+	reqCtx = context.WithValue(rc.Request.Context(), "rate_limit_state", state)
+	rc.Request = rc.Request.WithContext(reqCtx)
+
+	if !allowed {
+		headers := make(http.Header)
+		headers.Set("X-RateLimit-Limit", strconv.Itoa(routePolicy.LimitPerWindow))
+		headers.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+		headers.Set("X-RateLimit-Reset", strconv.Itoa(resetSecs))
+
+		return &plugin.ShortCircuit{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       []byte("too many requests"),
+			Headers:    headers,
+		}, nil
+	}
+
+	return nil, nil
+}
+
+func (p *RateLimitPlugin) OnResponse(ctx context.Context, rc *plugin.ResponseContext) error {
+	if rc.Response != nil && rc.Response.Request != nil {
+		if val := rc.Response.Request.Context().Value("rate_limit_state"); val != nil {
+			if state, ok := val.(*rateLimitState); ok {
+				rc.Response.Header.Set("X-RateLimit-Limit", strconv.Itoa(state.limit))
+				rc.Response.Header.Set("X-RateLimit-Remaining", strconv.Itoa(state.remaining))
+				rc.Response.Header.Set("X-RateLimit-Reset", strconv.Itoa(state.resetSecs))
+			}
 		}
 	}
 	return nil
+}
+
+func hashRoute(routePattern string) string {
+	hash := sha256.Sum256([]byte(routePattern))
+	return hex.EncodeToString(hash[:4])
 }

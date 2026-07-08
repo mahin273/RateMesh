@@ -28,6 +28,14 @@ func (m *mockRepository) CreateRoutePolicy(ctx context.Context, policy *RoutePol
 	return nil
 }
 
+func (m *mockRepository) GetPluginsByTenant(ctx context.Context, tenantID string) ([]*Plugin, error) {
+	return nil, nil
+}
+
+func (m *mockRepository) CreatePlugin(ctx context.Context, p *Plugin) error {
+	return nil
+}
+
 func TestResolveRoutePolicy(t *testing.T) {
 	repo := &mockRepository{
 		tenants: map[string]*Tenant{

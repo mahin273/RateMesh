@@ -6,6 +6,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"time"
+
+	"github.com/mahin273/RateMesh/internal/plugin"
+	"github.com/mahin273/RateMesh/internal/policy"
 )
 
 // Proxy wraps httputil.ReverseProxy to manage forwarding to downstream target services.
@@ -15,7 +18,8 @@ type Proxy struct {
 }
 
 // NewProxy creates a new ReverseProxy configured for the target URL.
-func NewProxy(targetURL string) (*Proxy, error) {
+// It hooks into ModifyResponse to run plugin OnResponse interceptors.
+func NewProxy(targetURL string, registry *plugin.Registry) (*Proxy, error) {
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return nil, err
@@ -29,6 +33,30 @@ func NewProxy(targetURL string) (*Proxy, error) {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Second, // Timeout waiting for response header
+	}
+
+	// Intercept response from upstream to run plugin OnResponse hooks
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.Request == nil {
+			return nil
+		}
+
+		tenant := policy.GetTenantFromContext(resp.Request.Context())
+		if tenant == nil {
+			return nil
+		}
+
+		enabled := plugin.GetEnabledPlugins(resp.Request.Context())
+		if enabled == nil {
+			return nil
+		}
+
+		rc := &plugin.ResponseContext{
+			TenantID: tenant.ID,
+			Response: resp,
+		}
+
+		return registry.RunOnResponse(resp.Request.Context(), rc, enabled)
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
