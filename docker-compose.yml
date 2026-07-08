@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: drlap
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d drlap"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrator:
+    image: ghcr.io/pressly/goose:v3.15.0
+    volumes:
+      - ./internal/db/migrations:/migrations
+    command: -dir /migrations postgres "postgres://postgres:postgres@db:5432/drlap?sslmode=disable" up
+    depends_on:
+      db:
+        condition: service_healthy
+
+  upstream:
+    image: hashicorp/http-echo:latest
+    command: -text="Hello from Upstream!"
+    ports:
+      - "8081:5678"
+
+  gateway-1:
+    build: .
+    environment:
+      PORT: "8080"
+      UPSTREAM_URL: "http://upstream:5678"
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/drlap?sslmode=disable"
+      REDIS_ADDRESS: "redis:6379"
+      SYNC_INTERVAL_MS: "250"
+      LOG_LEVEL: "info"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+
+  gateway-2:
+    build: .
+    environment:
+      PORT: "8080"
+      UPSTREAM_URL: "http://upstream:5678"
+      DATABASE_URL: "postgres://postgres:postgres@db:5432/drlap?sslmode=disable"
+      REDIS_ADDRESS: "redis:6379"
+      SYNC_INTERVAL_MS: "250"
+      LOG_LEVEL: "info"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+
+  haproxy:
+    image: haproxy:2.8-alpine
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "8000:80"
+    depends_on:
+      - gateway-1
+      - gateway-2
